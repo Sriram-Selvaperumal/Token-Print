@@ -29,7 +29,18 @@ export function wsGenerate(
   opts: GenOptions,
   handlers: GenHandlers,
 ): WebSocket {
-  const url = API_URL.replace(/^http/, "ws") + "/ws/generate";
+  // Determine WebSocket base URL and enforce wss://
+  let base = API_URL.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
+  if (typeof window !== "undefined" && window.location.protocol === "https:") {
+    base = base.replace(/^ws:/, "wss:");
+  } else if (!base.startsWith("ws://") && !base.startsWith("wss://")) {
+    base = `wss://${base.replace(/^[^:]+:\/\//, "")}`;
+  }
+  // Enforce wss:// for non-localhost/production destinations
+  if (!base.includes("localhost") && !base.includes("127.0.0.1") && base.startsWith("ws://")) {
+    base = base.replace(/^ws:/, "wss:");
+  }
+  const url = `${base.replace(/\/+$/, "")}/ws/generate`;
   const ws = new WebSocket(url);
 
   ws.onopen = () => {
