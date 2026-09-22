@@ -21,6 +21,18 @@ class QwenAdapter(ModelAdapter):
         vram_est = self.estimate_vram(config)
         max_ctx = config.get("max_position_embeddings") or config.get("seq_length") or 32768
 
+        _has_moe = "num_experts" in config or "num_local_experts" in config
+        moe_status = CapabilityStatus(
+            supported=_has_moe,
+            confidence="high",
+            reason=(
+                "Router logits captured via forward hooks on the gate module "
+                "(num_experts / num_experts_per_tok present in the Qwen2-MoE config)."
+                if _has_moe
+                else "Dense model; no expert routing."
+            ),
+        )
+
         return ModelCapabilities(
             supports_attention=CapabilityStatus(
                 supported=True,
@@ -52,6 +64,7 @@ class QwenAdapter(ModelAdapter):
                 confidence="high",
                 reason="Residual stream state injection supported.",
             ),
+            supports_moe_routing=moe_status,
             max_context_length=max_ctx,
             parameter_count=param_count,
             architecture="Qwen2ForCausalLM",

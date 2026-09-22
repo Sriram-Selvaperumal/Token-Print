@@ -4,6 +4,7 @@ import React, { useMemo } from "react";
 import * as THREE from "three";
 import { Line } from "@react-three/drei";
 import { SpatialMatrixPlane } from "./SpatialMatrixPlane";
+import { ExpertLanes3D } from "./ExpertLanes3D";
 import { LAYOUT } from "./ArchitectureLayout";
 import type { OperationKind } from "./TransformerOperationGraph";
 
@@ -343,6 +344,9 @@ export const TransformerLayer3D = React.memo(function TransformerLayer3D({
         emissiveIntensity={blockEmissive("down")}
         onClick={() => handleOp("mlp_down", `model.layers.${l}.mlp.down_proj.weight`)}
       />
+
+      {/* ── MoE Expert Lanes (Issue #294) ── */}
+      <ExpertLanes3D layerIndex={l} position={[0, MLP_Y - 1.2, LAYOUT.MLP_Z]} />
 
       {/* ── 8. Residual Add 2 (on spine) ── */}
       <SpatialMatrixPlane

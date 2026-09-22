@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Billboard, Text } from "@react-three/drei";
 import { Color, Euler, InstancedMesh, Matrix4, Quaternion, Vector3 } from "three";
 import AnnotationsOverlay from "./AnnotationsOverlay";
+import { ExpertLanes3D } from "./ExpertLanes3D";
 
 // §4 Visual Mapping — distinctive per-operation geometry, faithful to the REAL
 // Qwen2 decoder block (verified against Qwen2.5-0.5B config.json):
@@ -414,6 +415,11 @@ export default function TransformerStack({
               onPointerLeave={handleLeave}
               onClick={handleClick(li, "mlp")}
             />
+
+            {/* MoE Expert Lanes (Issue #294) */}
+            <group scale={0.35} position={[0, yMlp(li) - 0.45, 0.7]}>
+              <ExpertLanes3D layerIndex={li} />
+            </group>
           </group>
         );
       })}

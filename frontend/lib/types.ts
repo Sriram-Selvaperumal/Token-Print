@@ -57,6 +57,7 @@ export interface EffectiveCapabilities {
   supports_head_ablation: CapabilityStatus;
   supports_layer_ablation: CapabilityStatus;
   supports_activation_patch: CapabilityStatus;
+  supports_moe_routing?: CapabilityStatus;
   vram_estimate?: VRAMEstimate | null;
 }
 
@@ -304,6 +305,9 @@ export interface TokenFrame {
   // True when the token was drawn from the real sampling distribution
   // (decoding=sampling) rather than argmax. Honest provenance for the UI.
   sampled?: boolean;
+  // Issue #294 — MoE routing visualization: present on token frames when
+  // generating with a Mixture-of-Experts model.
+  expert_routing?: MoERouting;
 }
 
 export type GenStatus = "idle" | "streaming" | "done" | "error";

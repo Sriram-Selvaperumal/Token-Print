@@ -54,6 +54,14 @@ class GenericCausalLMAdapter(ModelAdapter):
                 confidence="low",
                 reason=f"Activation patching for unknown architecture '{arch_name}' is disabled.",
             ),
+            supports_moe_routing=CapabilityStatus(
+                supported=False,
+                confidence="low",
+                reason=(
+                    f"Unknown architecture '{arch_name}': cannot guarantee gate-module "
+                    "naming convention required by _detect_moe_blocks()."
+                ),
+            ),
             max_context_length=max_ctx,
             parameter_count=param_count,
             architecture=arch_name,

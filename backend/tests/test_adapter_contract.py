@@ -1,11 +1,13 @@
 """Standardized contract tests for all ModelAdapter implementations."""
 
 import pytest
+from app.inference.adapters.deepseek import DeepseekAdapter
 from app.inference.adapters.gemma import GemmaAdapter
 from app.inference.adapters.generic import GenericCausalLMAdapter
 from app.inference.adapters.gpt2 import GPT2Adapter
 from app.inference.adapters.llama import LlamaAdapter
 from app.inference.adapters.mistral import MistralAdapter
+from app.inference.adapters.mixtral import MixtralAdapter
 from app.inference.adapters.qwen import QwenAdapter
 
 
@@ -17,6 +19,8 @@ from app.inference.adapters.qwen import QwenAdapter
         GPT2Adapter(),
         MistralAdapter(),
         GemmaAdapter(),
+        MixtralAdapter(),
+        DeepseekAdapter(),
         GenericCausalLMAdapter(),
     ],
 )
@@ -28,6 +32,8 @@ def test_adapter_contract_interface(adapter):
         "num_hidden_layers": 24,
         "vocab_size": 32000,
     }
+    if adapter.family_name == "deepseek":
+        dummy_config["n_routed_experts"] = 64
 
     capabilities = adapter.get_capabilities(dummy_config)
 
@@ -37,10 +43,21 @@ def test_adapter_contract_interface(adapter):
     assert hasattr(capabilities, "supports_head_ablation")
     assert hasattr(capabilities, "supports_layer_ablation")
     assert hasattr(capabilities, "supports_activation_patch")
+    assert hasattr(capabilities, "supports_moe_routing")
 
     assert capabilities.supports_attention.supported in (True, False)
     assert capabilities.supports_attention.confidence in ("high", "medium", "low", "approximate")
     assert isinstance(capabilities.supports_attention.reason, str)
+
+    assert capabilities.supports_moe_routing.supported in (True, False)
+    assert capabilities.supports_moe_routing.confidence in ("high", "medium", "low", "approximate")
+    assert isinstance(capabilities.supports_moe_routing.reason, str)
+
+    # Specific MoE adapters must report True; dense adapters must report False
+    if adapter.family_name in ("mixtral", "deepseek"):
+        assert capabilities.supports_moe_routing.supported is True
+    else:
+        assert capabilities.supports_moe_routing.supported is False
 
     vram = adapter.estimate_vram(dummy_config)
     assert vram.estimated_vram_gb > 0.0

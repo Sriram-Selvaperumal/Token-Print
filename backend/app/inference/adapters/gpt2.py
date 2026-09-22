@@ -52,6 +52,11 @@ class GPT2Adapter(ModelAdapter):
                 confidence="high",
                 reason="Residual stream state injection supported.",
             ),
+            supports_moe_routing=CapabilityStatus(
+                supported=False,
+                confidence="high",
+                reason="Dense model; no expert routing.",
+            ),
             max_context_length=max_ctx,
             parameter_count=param_count,
             architecture="GPT2LMHeadModel",

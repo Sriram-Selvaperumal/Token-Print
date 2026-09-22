@@ -27,6 +27,7 @@ class ExampleAdapter(ModelAdapter):
             supports_head_ablation=unavailable,
             supports_layer_ablation=unavailable,
             supports_activation_patch=unavailable,
+            supports_moe_routing=unavailable,
             max_context_length=config.get("max_position_embeddings", 0),
             parameter_count=self._extract_param_count(config),
             architecture="ExampleDecoder",

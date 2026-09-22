@@ -36,6 +36,9 @@ class ModelCapabilities(BaseModel):
     supports_head_ablation: CapabilityStatus
     supports_layer_ablation: CapabilityStatus
     supports_activation_patch: CapabilityStatus
+    # Issue #294 — MoE routing (Mixtral, DeepSeek, Qwen2Moe). Dense adapters
+    # set this explicitly to supported=False so the schema is always complete.
+    supports_moe_routing: CapabilityStatus
     max_context_length: int = 2048
     parameter_count: int | None = None
     architecture: str = "Unknown"
@@ -74,6 +77,10 @@ class EffectiveCapabilities(BaseModel):
     supports_head_ablation: CapabilityStatus
     supports_layer_ablation: CapabilityStatus
     supports_activation_patch: CapabilityStatus
+    # Forwarded from ModelCapabilities; None means the selected adapter did
+    # not explicitly declare this capability (only expected for legacy adapters
+    # that pre-date issue #294).
+    supports_moe_routing: CapabilityStatus | None = None
 
     vram_estimate: VRAMEstimate | None = None
 
@@ -129,5 +136,6 @@ def calculate_effective_capabilities(
         supports_head_ablation=head_abl,
         supports_layer_ablation=layer_abl,
         supports_activation_patch=patch,
+        supports_moe_routing=model_caps.supports_moe_routing,
         vram_estimate=model_caps.vram_estimate,
     )

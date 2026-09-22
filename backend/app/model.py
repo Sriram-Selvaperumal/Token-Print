@@ -412,32 +412,58 @@ class ModelEngine:
             for h in handles:
                 h.remove()
 
-        imports_ok = True
-        try:
-            import torch.nn.functional as F
-        except Exception:  # noqa: BLE001
-            imports_ok = False
-        if not imports_ok:
-            return None
+        return self._routing_from_captured(captured, blocks)
 
-        import torch.nn.functional as F
+    @staticmethod
+    def _routing_from_captured(
+        captured: dict[int, torch.Tensor],
+        blocks: list[dict],
+    ) -> dict:
+        """Convert raw captured gate tensors into a serialisable routing dict.
+
+        This is the single canonical softmax → top-k transform for router
+        logits captured via forward hooks.  Both :meth:`_capture_moe_routing`
+        (analyze path, full-sentence) and :meth:`generate_steps` (streaming
+        path, per-decoded-position) call this helper so the math is never
+        duplicated.
+
+        Args:
+            captured: mapping of ``layer_index → raw gate output tensor``
+                      with shape ``[batch, seq, n_experts]`` or
+                      ``[seq, n_experts]`` (both forms are normalised below).
+            blocks: list of dicts as returned by :meth:`_detect_moe_blocks`.
+
+        Returns:
+            ``{"per_layer": [{"layer", "n_experts", "used",
+            "routing": [{"token", "experts": [{"idx", "weight"}]}]}]}``
+            with the top-``used`` experts per decoded position.
+        """
+        import torch.nn.functional as F  # always available; import is O(1) after first call
 
         per_layer: list[dict] = []
         for b in blocks:
             logits = captured.get(b["layer"])
             if logits is None:
                 continue
-            logits = logits[0]  # [seq, n_experts]
+            # Normalise to [seq, n_experts]: drop batch dim if present.
+            if logits.dim() == 3:
+                logits = logits[0]
             probs = F.softmax(logits, dim=-1)
             k = min(b["used"], b["n_experts"])
             topk = torch.topk(probs, k, dim=-1)
-            routing = []
-            for t_idx in range(logits.shape[0]):
-                experts = [
-                    {"idx": int(e), "weight": round(float(w), 4)}
-                    for e, w in zip(topk.indices[t_idx].tolist(), topk.values[t_idx].tolist())
-                ]
-                routing.append({"token": t_idx, "experts": experts})
+            routing = [
+                {
+                    "token": t_idx,
+                    "experts": [
+                        {"idx": int(e), "weight": round(float(w), 4)}
+                        for e, w in zip(
+                            topk.indices[t_idx].tolist(),
+                            topk.values[t_idx].tolist(),
+                        )
+                    ],
+                }
+                for t_idx in range(logits.shape[0])
+            ]
             per_layer.append(
                 {
                     "layer": b["layer"],
@@ -1007,42 +1033,7 @@ class ModelEngine:
 
         # MoE routing (issue #83): build from router logits captured above.
         if moe_blocks:
-            try:
-                import torch.nn.functional as F
-            except Exception:  # noqa: BLE001
-                F = None
-            if F is not None:
-                per_layer: list[dict] = []
-                for b in moe_blocks:
-                    logits = moe_captured.get(b["layer"])
-                    if logits is None:
-                        continue
-                    lg = logits[0]  # [seq, n_experts]
-                    probs = F.softmax(lg, dim=-1)
-                    k = min(b["used"], b["n_experts"])
-                    topk = torch.topk(probs, k, dim=-1)
-                    routing = [
-                        {
-                            "token": t_idx,
-                            "experts": [
-                                {"idx": int(e), "weight": round(float(w), 4)}
-                                for e, w in zip(
-                                    topk.indices[t_idx].tolist(),
-                                    topk.values[t_idx].tolist(),
-                                )
-                            ],
-                        }
-                        for t_idx in range(lg.shape[0])
-                    ]
-                    per_layer.append(
-                        {
-                            "layer": b["layer"],
-                            "n_experts": b["n_experts"],
-                            "used": k,
-                            "routing": routing,
-                        }
-                    )
-                result["moe_routing"] = {"per_layer": per_layer}
+            result["moe_routing"] = self._routing_from_captured(moe_captured, moe_blocks)
         return result
 
     def _eos_ids(self) -> set[int]:
@@ -1111,14 +1102,19 @@ class ModelEngine:
         with self._lock, torch.no_grad():
             # Build the prompt. The chat template makes the instruct model
             # actually respond (coherent generation); raw mode just continues text.
-            if use_chat_template:
-                enc = self.tokenizer.apply_chat_template(
-                    [{"role": "user", "content": prompt}],
-                    add_generation_prompt=True,
-                    return_tensors="pt",
-                    return_dict=True,
-                )
-            else:
+            applied_chat = False
+            if use_chat_template and getattr(self.tokenizer, "chat_template", None):
+                try:
+                    enc = self.tokenizer.apply_chat_template(
+                        [{"role": "user", "content": prompt}],
+                        add_generation_prompt=True,
+                        return_tensors="pt",
+                        return_dict=True,
+                    )
+                    applied_chat = True
+                except (ValueError, TypeError, AttributeError, RuntimeError):
+                    applied_chat = False
+            if not applied_chat:
                 enc = self.tokenizer(prompt, return_tensors="pt")
             input_ids = enc["input_ids"].to(self.device)
 
@@ -1164,6 +1160,35 @@ class ModelEngine:
             drafts_accepted = 0
             draft_batches = 0
 
+            # -- MoE routing hooks (issue #294, Phase 5.1) ------------------
+            # Detect MoE blocks ONCE before the decode loop: _detect_moe_blocks()
+            # is a pure structural scan (no forward pass), and the result is
+            # static for the lifetime of the loaded model, so there is no reason
+            # to re-run it every iteration.
+            #
+            # For dense models moe_blocks is empty and we take the fast path:
+            # no hooks are registered, no dict is allocated, and 'expert_routing'
+            # never appears in any emitted frame — zero overhead.
+            moe_blocks = self._detect_moe_blocks()
+            _moe_captured: dict[int, torch.Tensor] = {}
+            _moe_handles: list = []
+            if moe_blocks:
+                # Register one hook per gate module.  Hooks are shared across
+                # all decode steps: each call to self.model(...) overwrites the
+                # dict entry for that layer with the *current* step's tensor.
+                # KV-cache decode steps process only the new position(s), so
+                # the captured tensor naturally corresponds to exactly the
+                # positions decoded in this step — no slicing required.
+                def _make_moe_hook(layer_idx: int):
+                    def _hook(_mod, _inp, out):
+                        _moe_captured[layer_idx] = out.detach().float().cpu()
+                    return _hook
+
+                for _b in moe_blocks:
+                    _moe_handles.append(
+                        _b["gate"].register_forward_hook(_make_moe_hook(_b["layer"]))
+                    )
+
             def emit_frame(step, chosen_id, probs, logits, hidden_states,
                            phase, n_positions, cache_len_in, extra: dict | None = None):
                 topk = probs.topk(top_k)
@@ -1198,152 +1223,189 @@ class ModelEngine:
                 return frame
 
             step = 0
-            while step < max_new_tokens:
-                n_positions = int(cur.shape[1])
-                cache_len_in = state.positions_done
-                phase = "prefill" if state.past_key_values is None else "decode"
+            try:
+                while step < max_new_tokens:
+                    n_positions = int(cur.shape[1])
+                    cache_len_in = state.positions_done
+                    phase = "prefill" if state.past_key_values is None else "decode"
 
-                if decoding_mode == "sliding_window" and state.past_key_values is not None and state.positions_done > window_size:
-                    state.trim_cache(window_size)
-                    cache_len_in = window_size  # after trim, the model is fed exactly window_size entries
+                    if decoding_mode == "sliding_window" and state.past_key_values is not None and state.positions_done > window_size:
+                        state.trim_cache(window_size)
+                        cache_len_in = window_size  # after trim, the model is fed exactly window_size entries
 
-                out = self.model(
-                    input_ids=cur,
-                    past_key_values=state.past_key_values,
-                    use_cache=True,
-                    output_hidden_states=True,
-                )
-                state.past_key_values = out.past_key_values
-                state.positions_done += n_positions
-
-                logits = out.logits[:, -1, :]
-                probs = logits.softmax(-1)
-
-                if decoding_mode == "speculative" and phase == "decode" and draft_gamma > 1 and step + draft_gamma <= max_new_tokens:
-                    # --- Self-speculative pass: draft + verify in one batch. ---
-                    draft_batches += 1
-                    # The draft distribution is the model's own next-token
-                    # distribution sharpened (temperature 0.6) — a cheap,
-                    # confident draft. torch.multinomial segfaults on MPS, so
-                    # we sample on CPU (one small vocab-vector copy).
-                    draft_probs = (logits / 0.6).softmax(-1)[0].float().cpu()
-                    draft_ids = torch.multinomial(
-                        draft_probs, draft_gamma, replacement=True
-                    )
-                    draft_seq = [int(d) for d in draft_ids.tolist()]
-                    draft_tokens = torch.tensor([draft_seq], device=self.device)
-                    vout = self.model(
-                        input_ids=draft_tokens,
+                    out = self.model(
+                        input_ids=cur,
                         past_key_values=state.past_key_values,
                         use_cache=True,
                         output_hidden_states=True,
                     )
-                    vlogits = vout.logits  # [1, gamma, vocab]
-                    vprobs = vlogits.softmax(-1)
+                    state.past_key_values = out.past_key_values
+                    state.positions_done += n_positions
 
-                    # Update KV cache state with verification output, then roll
-                    # back unaccepted draft token cache entries.
-                    state.past_key_values = vout.past_key_values
-                    state.positions_done += draft_gamma
+                    logits = out.logits[:, -1, :]
+                    probs = logits.softmax(-1)
 
-                    # Acceptance prefix. Draft token 0 is checked against the
-                    # pre-draft decode distribution; draft token g (>=1) against
-                    # the verify row g-1 (the prediction made after reading the
-                    # earlier drafts). That row *is* the single-step forward the
-                    # verify pass reuses — the batched count of 1.
-                    k = 0
-                    if draft_seq[0] == int(probs.argmax().item()):
-                        k = 1
-                        for g in range(1, draft_gamma):
-                            if draft_seq[g] == int(vprobs[0, g - 1].argmax().item()):
-                                k += 1
-                            else:
-                                break
-                    drafts_accepted += k
+                    if decoding_mode == "speculative" and phase == "decode" and draft_gamma > 1 and step + draft_gamma <= max_new_tokens:
+                        # --- Self-speculative pass: draft + verify in one batch. ---
+                        draft_batches += 1
+                        # The draft distribution is the model's own next-token
+                        # distribution sharpened (temperature 0.6) — a cheap,
+                        # confident draft. torch.multinomial segfaults on MPS, so
+                        # we sample on CPU (one small vocab-vector copy).
+                        draft_probs = (logits / 0.6).softmax(-1)[0].float().cpu()
+                        draft_ids = torch.multinomial(
+                            draft_probs, draft_gamma, replacement=True
+                        )
+                        draft_seq = [int(d) for d in draft_ids.tolist()]
+                        draft_tokens = torch.tensor([draft_seq], device=self.device)
+                        draft_moe_captured = dict(_moe_captured) if moe_blocks else {}
+                        vout = self.model(
+                            input_ids=draft_tokens,
+                            past_key_values=state.past_key_values,
+                            use_cache=True,
+                            output_hidden_states=True,
+                        )
+                        verify_moe_captured = dict(_moe_captured) if moe_blocks else {}
+                        vlogits = vout.logits  # [1, gamma, vocab]
+                        vprobs = vlogits.softmax(-1)
 
-                    # Roll back KV cache to discard unaccepted draft tokens
-                    state.rollback_speculative_drafts(k, draft_gamma)
+                        # Update KV cache state with verification output, then roll
+                        # back unaccepted draft token cache entries.
+                        state.past_key_values = vout.past_key_values
+                        state.positions_done += draft_gamma
 
-                    # Tokens to emit this step: k accepted drafts + 1 target
-                    # continuation token (the model's own greedy next token).
-                    if k == draft_gamma:
-                        cont = int(vprobs[0, draft_gamma - 1].argmax().item())
-                    elif k >= 1:
-                        cont = int(vprobs[0, k - 1].argmax().item())
-                    else:
-                        cont = int(probs.argmax().item())
-                    emit_ids = draft_seq[:k] + [cont]
+                        # Acceptance prefix. Draft token 0 is checked against the
+                        # pre-draft decode distribution; draft token g (>=1) against
+                        # the verify row g-1 (the prediction made after reading the
+                        # earlier drafts). That row *is* the single-step forward the
+                        # verify pass reuses — the batched count of 1.
+                        k = 0
+                        if draft_seq[0] == int(probs.argmax().item()):
+                            k = 1
+                            for g in range(1, draft_gamma):
+                                if draft_seq[g] == int(vprobs[0, g - 1].argmax().item()):
+                                    k += 1
+                                else:
+                                    break
+                        drafts_accepted += k
 
-                    for g, cid in enumerate(emit_ids):
-                        if g == 0:
-                            row_probs, row_logits = probs, logits
-                            row_hs = out.hidden_states
+                        # Roll back KV cache to discard unaccepted draft tokens
+                        state.rollback_speculative_drafts(k, draft_gamma)
+
+                        # Tokens to emit this step: k accepted drafts + 1 target
+                        # continuation token (the model's own greedy next token).
+                        if k == draft_gamma:
+                            cont = int(vprobs[0, draft_gamma - 1].argmax().item())
+                        elif k >= 1:
+                            cont = int(vprobs[0, k - 1].argmax().item())
                         else:
-                            r = max(0, min(g - 1, draft_gamma - 1))
-                            row_probs = vprobs[:, r:r + 1, :].squeeze(1)
-                            row_logits = vlogits[:, r:r + 1, :].squeeze(1)
-                            row_hs = [h[:, r:r + 1, :] for h in vout.hidden_states]
-                        generated_ids.append(cid)
-                        yield emit_frame(
-                            step, cid, row_probs, row_logits, row_hs,
-                            phase, n_positions, cache_len_in,
-                            {
+                            cont = int(probs.argmax().item())
+                        emit_ids = draft_seq[:k] + [cont]
+
+                        for g, cid in enumerate(emit_ids):
+                            if g == 0:
+                                row_probs, row_logits = probs, logits
+                                row_hs = out.hidden_states
+                            else:
+                                r = max(0, min(g - 1, draft_gamma - 1))
+                                row_probs = vprobs[:, r:r + 1, :].squeeze(1)
+                                row_logits = vlogits[:, r:r + 1, :].squeeze(1)
+                                row_hs = [h[:, r:r + 1, :] for h in vout.hidden_states]
+                            generated_ids.append(cid)
+                            frame_extra = {
                                 "accepted_drafts": True,
                                 "draft_batch": True,
                                 "n_accepted": k,
                                 "draft_pos": g,
                                 "spec_cont": g >= k,
-                            },
-                        )
-                        step += 1
-                        cache_len_in += 1
-                        if cid in eos_ids:
-                            break
-                    chosen_id = generated_ids[-1]
-                    if chosen_id in eos_ids:
-                        break
-                    cur = torch.tensor([[chosen_id]], device=self.device)
-                    continue
-                else:
-                    if seed is not None:
-                        torch.manual_seed(seed)
-
-                    # Greedy decode is argmax regardless of temperature; only the
-                    # explicit "sampling" mode draws from the true distribution.
-                    if decoding_mode == "greedy" or temperature <= 0.001:
-                        chosen_id = int(probs.argmax().item())
-                    else:
-                        scaled_logits = logits / max(temperature, 1e-4)
-                        # Top-K: keep only the top_k logits (real, affects which
-                        # tokens can be drawn at all).
-                        if top_k < scaled_logits.shape[-1]:
-                            kth = torch.topk(scaled_logits, top_k, dim=-1).values[..., -1:]
-                            scaled_logits = torch.where(
-                                scaled_logits < kth,
-                                torch.full_like(scaled_logits, float("-inf")),
-                                scaled_logits,
+                            }
+                            if moe_blocks:
+                                if g == 0 and draft_moe_captured:
+                                    frame_extra["expert_routing"] = self._routing_from_captured(
+                                        draft_moe_captured, moe_blocks
+                                    )
+                                elif g > 0 and verify_moe_captured:
+                                    r = max(0, min(g - 1, draft_gamma - 1))
+                                    sliced_cap = {
+                                        _l: (_t[:, r : r + 1, :] if _t.dim() == 3 else _t[r : r + 1, :])
+                                        for _l, _t in verify_moe_captured.items()
+                                    }
+                                    frame_extra["expert_routing"] = self._routing_from_captured(
+                                        sliced_cap, moe_blocks
+                                    )
+                            yield emit_frame(
+                                step, cid, row_probs, row_logits, row_hs,
+                                phase, n_positions, cache_len_in,
+                                frame_extra,
                             )
-                        # Top-P (nucleus) filtering if requested.
-                        if top_p < 0.999:
-                            sorted_logits, sorted_indices = torch.sort(scaled_logits, descending=True)
-                            cumulative_probs = torch.cumsum(sorted_logits.softmax(-1), dim=-1)
-                            sorted_indices_to_remove = cumulative_probs > top_p
-                            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                            sorted_indices_to_remove[..., 0] = 0
-                            indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-                            scaled_logits[indices_to_remove] = float('-inf')
+                            step += 1
+                            cache_len_in += 1
+                            if cid in eos_ids:
+                                break
+                        chosen_id = generated_ids[-1]
+                        if chosen_id in eos_ids:
+                            break
+                        cur = torch.tensor([[chosen_id]], device=self.device)
+                        continue
+                    else:
+                        if seed is not None:
+                            torch.manual_seed(seed)
 
-                        sample_probs = scaled_logits.softmax(-1)[0].float().cpu()
-                        chosen_id = int(torch.multinomial(sample_probs, 1).item())
+                        # Greedy decode is argmax regardless of temperature; only the
+                        # explicit "sampling" mode draws from the true distribution.
+                        if decoding_mode == "greedy" or temperature <= 0.001:
+                            chosen_id = int(probs.argmax().item())
+                        else:
+                            scaled_logits = logits / max(temperature, 1e-4)
+                            # Top-K: keep only the top_k logits (real, affects which
+                            # tokens can be drawn at all).
+                            if top_k < scaled_logits.shape[-1]:
+                                kth = torch.topk(scaled_logits, top_k, dim=-1).values[..., -1:]
+                                scaled_logits = torch.where(
+                                    scaled_logits < kth,
+                                    torch.full_like(scaled_logits, float("-inf")),
+                                    scaled_logits,
+                                )
+                            # Top-P (nucleus) filtering if requested.
+                            if top_p < 0.999:
+                                sorted_logits, sorted_indices = torch.sort(scaled_logits, descending=True)
+                                cumulative_probs = torch.cumsum(sorted_logits.softmax(-1), dim=-1)
+                                sorted_indices_to_remove = cumulative_probs > top_p
+                                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                                sorted_indices_to_remove[..., 0] = 0
+                                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                                scaled_logits[indices_to_remove] = float('-inf')
 
-                    generated_ids.append(chosen_id)
-                    yield emit_frame(step, chosen_id, probs, logits, out.hidden_states,
-                                     phase, n_positions, cache_len_in,
-                                     {"sampled": decoding_mode == "sampling"})
-                    step += 1
-                    if chosen_id in eos_ids:
-                        break
-                    cur = torch.tensor([[chosen_id]], device=self.device)
+                            sample_probs = scaled_logits.softmax(-1)[0].float().cpu()
+                            chosen_id = int(torch.multinomial(sample_probs, 1).item())
+
+                        generated_ids.append(chosen_id)
+                        # Build expert_routing for this decode step if the model is MoE.
+                        # 'expert_routing' (per-step, streaming) is deliberately named
+                        # differently from analyze()'s 'moe_routing' (full-sentence,
+                        # static). They share the same per-layer shape but differ in
+                        # the number of token positions they cover: a streaming frame
+                        # covers only the position(s) decoded in this step, whereas
+                        # moe_routing covers the entire input sentence at once.
+                        _moe_extra: dict = {"sampled": decoding_mode == "sampling"}
+                        if moe_blocks and _moe_captured:
+                            _moe_extra["expert_routing"] = self._routing_from_captured(
+                                _moe_captured, moe_blocks
+                            )
+                        yield emit_frame(step, chosen_id, probs, logits, out.hidden_states,
+                                         phase, n_positions, cache_len_in, _moe_extra)
+                        step += 1
+                        if chosen_id in eos_ids:
+                            break
+                        cur = torch.tensor([[chosen_id]], device=self.device)
+
+            finally:
+                # Always clean up MoE hooks, even if the generator is closed
+                # mid-generation (e.g. client disconnects). Leaking hook handles
+                # would keep the gate tensors alive and accumulate with every
+                # subsequent generation on the same model instance.
+                for _h in _moe_handles:
+                    _h.remove()
 
             # Needle recall report.
             if needle:
@@ -1455,10 +1517,21 @@ class ModelEngine:
                 }
             )
             add(layer.self_attn.o_proj, "attn.o", i)
-            add(layer.post_attention_layernorm, "norm", i)
-            add(layer.mlp.gate_proj, "mlp.gate", i)
-            add(layer.mlp.up_proj, "mlp.up", i)
-            add(layer.mlp.down_proj, "mlp.down", i)
+            mlp_module = getattr(layer, "mlp", None)
+            if mlp_module is not None and all(
+                hasattr(mlp_module, name)
+                for name in ("gate_proj", "up_proj", "down_proj")
+            ):
+                add(mlp_module.gate_proj, "mlp.gate", i)
+                add(mlp_module.up_proj, "mlp.up", i)
+                add(mlp_module.down_proj, "mlp.down", i)
+            else:
+                # MoE block (e.g. Mixtral block_sparse_moe, DeepSeek, Qwen2MoE)
+                for _child_name, _child in layer.named_children():
+                    for _sub_name, _sub in _child.named_children():
+                        if _sub_name in ("gate", "router", "gate_proj"):
+                            add(_sub, "mlp.gate", i)
+                            break
         add(base.norm, "norm", None)
         if getattr(self.model, "lm_head", None) is not None:
             add(self.model.lm_head, "output", None)

@@ -5,11 +5,13 @@ from __future__ import annotations
 from typing import Any
 
 from app.inference.adapters.base import ModelAdapter
+from app.inference.adapters.deepseek import DeepseekAdapter
 from app.inference.adapters.gemma import GemmaAdapter
 from app.inference.adapters.generic import GenericCausalLMAdapter
 from app.inference.adapters.gpt2 import GPT2Adapter
 from app.inference.adapters.llama import LlamaAdapter
 from app.inference.adapters.mistral import MistralAdapter
+from app.inference.adapters.mixtral import MixtralAdapter
 from app.inference.adapters.qwen import QwenAdapter
 
 # Priority list of specific model adapters
@@ -17,6 +19,8 @@ SPECIFIC_ADAPTERS: list[ModelAdapter] = [
     QwenAdapter(),
     LlamaAdapter(),
     GPT2Adapter(),
+    MixtralAdapter(),
+    DeepseekAdapter(),
     MistralAdapter(),
     GemmaAdapter(),
 ]

@@ -17,6 +17,7 @@ def test_calculate_effective_capabilities_high_compatibility():
         supports_head_ablation=CapabilityStatus(supported=True, confidence="high", reason="Head ablation"),
         supports_layer_ablation=CapabilityStatus(supported=True, confidence="high", reason="Layer ablation"),
         supports_activation_patch=CapabilityStatus(supported=True, confidence="high", reason="Patching"),
+        supports_moe_routing=CapabilityStatus(supported=True, confidence="high", reason="MoE routing"),
     )
     backend_caps = BackendCapabilities(
         backend_name="hf_local",
@@ -32,6 +33,7 @@ def test_calculate_effective_capabilities_high_compatibility():
     assert eff.compatibility_level == "High"
     assert eff.supports_attention.supported is True
     assert eff.supports_hidden_states.supported is True
+    assert eff.supports_moe_routing.supported is True
 
 
 def test_calculate_effective_capabilities_backend_limitation():
@@ -42,6 +44,7 @@ def test_calculate_effective_capabilities_backend_limitation():
         supports_head_ablation=CapabilityStatus(supported=True, confidence="high", reason="Head ablation"),
         supports_layer_ablation=CapabilityStatus(supported=True, confidence="high", reason="Layer ablation"),
         supports_activation_patch=CapabilityStatus(supported=True, confidence="high", reason="Patching"),
+        supports_moe_routing=CapabilityStatus(supported=False, confidence="high", reason="Dense model"),
     )
     # Backend that cannot capture attention or ablate (e.g. basic provider API)
     backend_caps = BackendCapabilities(
