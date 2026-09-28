@@ -9,8 +9,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pytest
-from pydantic import ValidationError
-
 from app.schemas import (
     AblateRequest,
     AnalyzeImageRequest,
@@ -21,13 +19,13 @@ from app.schemas import (
     HFSearchResponse,
     ModelInfo,
     PatchRequest,
-    Projection,
     ProvenanceInfo,
     RagAnalyzeRequest,
     RagAnalyzeResponse,
     RagChunk,
     Token,
 )
+from pydantic import ValidationError
 
 
 def test_analyze_request_schema():
